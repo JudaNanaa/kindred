@@ -128,7 +128,7 @@ With `g` the upstream adjoint and `⊕` graph-level accumulation:
 | `reduceWindowMax` | `y[i] = max_j x[i+j]` | route `g[i]` to argmax `j`; **ties → `g / count`, not 0** |
 | `param`, `input`, `constant`, `iota` | — | leaf, no rule |
 
-`logSoftmax` rather than `softmax` is the v1 primitive: it is numerically stable and its derivative is a single fused expression, which is what makes the cross-entropy gradient cheap. Jalon 1 covers the first six rows plus `logSoftmax` and `reduceSum`, one `tests/grad_check` case each.
+`logSoftmax` rather than `softmax` is the v1 primitive: it is numerically stable and its derivative is a single fused expression, which is what makes the cross-entropy gradient cheap. Milestone 1 covers the first six rows plus `logSoftmax` and `reduceSum`, one `tests/grad_check` case each.
 
 ---
 
@@ -150,7 +150,7 @@ With `g` the upstream adjoint and `⊕` graph-level accumulation:
 | `reduceWindowMax` | `stablehlo.reduce_window` + `stablehlo.reduce_max` |
 | `crossEntropy` | composed from `logSoftmax` + `iota` + `reduceSum` — no dedicated op needed |
 
-**Conventions.** One `func.func @main` *(entry-name requirement unconfirmed, see À VÉRIFIER #1)*. Arguments are params first in declaration order, then non-param inputs in declaration order: `(%p0: tensor<784x256xf32>, ..., %batch: tensor<128x784xf32>, %labels: tensor<128xi32>)`. Results are positional: scalar loss first, then one gradient per trainable param in the same order. There is no implicit f32 upcast anywhere; `i32` labels stay `i32`. `ProgramSpec` is the single source of truth for arg/result order, shared by the emitter, the runtime wrapper, and the oracle, so the order is never written down twice.
+**Conventions.** One `func.func @main` *(entry-name requirement unconfirmed, see TO VERIFY #1)*. Arguments are params first in declaration order, then non-param inputs in declaration order: `(%p0: tensor<784x256xf32>, ..., %batch: tensor<128x784xf32>, %labels: tensor<128xi32>)`. Results are positional: scalar loss first, then one gradient per trainable param in the same order. There is no implicit f32 upcast anywhere; `i32` labels stay `i32`. `ProgramSpec` is the single source of truth for arg/result order, shared by the emitter, the runtime wrapper, and the oracle, so the order is never written down twice.
 
 ---
 
@@ -158,16 +158,17 @@ With `g` the upstream adjoint and `⊕` graph-level accumulation:
 
 ### Header provenance
 
-Vendor `xla/pjrt/c/pjrt_c_api.h` into `vendor/` at a **pinned commit SHA** — openxla/xla publishes no GitHub Releases, so there is no version number to pin to. Record the SHA and its `PJRT_API_MINOR` in `vendor/PINNED`, and have CI re-download and diff. At time of writing: `PJRT_API_MAJOR = 0`, `PJRT_API_MINOR = 116`, `PJRT_Api_STRUCT_SIZE = 1144`.
+Vendor the header **that the plugin itself was compiled against**, not `openxla/xla` HEAD. The only such artifact found is the one bundled in the `xla-cpu-pjrt` PyPI wheel, at `xla_plugins/xla_cpu_pjrt/include/pjrt_c_api.h`; it lands in `third_party/pjrt/include/pjrt_c_api.h`. `third_party/pjrt/PINNED` records the package, the wheel sha256, the path inside the archive, the header's own sha256 and its `PJRT_API_*` values, and `scripts/package_pjrt_releases.sh` is the procedure that re-fetches and republishes per platform. At time of writing: `xla-cpu-pjrt 0.0.1`, `PJRT_API_MAJOR = 0`, `PJRT_API_MINOR = 81`. The original plan — pin an `openxla/xla` commit SHA, since the project publishes no GitHub Releases — does not work in practice: pinning to HEAD means the header is *newer* than the prebuilt plugin, and every entry added after 0.81 is a hole the plugin will never fill. See §6 "PJRT-specific risks" for why the arrow has to point the other way.
 
 ### Binding from Zig — measured, not assumed
 
 ```zig
 const tc = b.addTranslateC(.{
-    .root_source_file = b.path("vendor/pjrt_c_api.h"),
+    .root_source_file = b.path("third_party/pjrt/include/pjrt_c_api.h"),
     .target = target, .optimize = optimize,
 });
-const c = tc.addModule("c");   // then: .imports = &.{.{ .name = "c", .module = c }}
+const c = tc.createModule();
+// then: .imports = &.{.{ .name = "pjrt_c", .module = c }}
 ```
 
 I ran this against the real header under Zig 0.16.0. It translates cleanly — anonymous unions, `offsetof`, and the `PJRT_DEFINE_STRUCT_TRAITS` constants all survive. The consequences below are observed, not inferred:
@@ -175,7 +176,7 @@ I ran this against the real header under Zig 0.16.0. It translates cleanly — a
 | C construct | translate-c produces | Kindred must |
 |---|---|---|
 | `typedef enum {…} PJRT_Buffer_Type;` | `pub const PJRT_Buffer_Type = c_uint;` + file-scope `pub const PJRT_Buffer_Type_F32: c_int = 11;` | Declare our own `enum(DType)` mirror and `@intCast`. The generated file contains **zero** Zig enums. |
-| anonymous `union` in `PJRT_NamedValue` | field `unnamed_0: union_unnamed_9` | Always initialise via `.unnamed_0 = .{ .int64_value = … }` |
+| anonymous `union` in `PJRT_NamedValue` | field `unnamed_0: union_unnamed_6` — the number is positional and shifts with the header version | Always initialise via `.unnamed_0 = .{ .int64_value = … }` |
 | `enum { X_STRUCT_SIZE = … }` | file-scope `pub const X_STRUCT_SIZE: c_int` — **not** a struct member | `@intCast` when assigning to `struct_size: usize` |
 | `struct X_Args { size_t struct_size; … }` | `X_Args = struct_X_Args` with `= 0` / `= null` defaults | `struct_size = @sizeOf(c.X_Args)` |
 
@@ -198,7 +199,7 @@ pub fn loadPlugin(path: []const u8) !std.DynLib {
 
 I compiled a stub plugin against the real header, exported `GetPjrtApi`, and loaded it from Zig via `std.DynLib`: the symbol is unmangled, the lookup succeeds, and calling through the returned `PJRT_Api` table works.
 
-**Discovery order:** `-Dplugin=<path>` build option → `KINDRED_PJRT_PLUGIN` env var → a candidate list (À VÉRIFIER #4). No auto-download: a library must not silently fetch a compiler at build time.
+**Discovery order:** `-Dpjrt_plugin=<path>` build option → the pinned prebuilt plugin from the lazy dependency (skipped entirely with `-Dbundle_pjrt=false`) → null, in which case the PJRT tests skip. No auto-download: a library must not silently fetch a compiler at build time.
 
 ### Lifecycle
 
@@ -218,9 +219,9 @@ DynLib.open → GetPjrtApi() → check pjrt_api_version.major/minor
          destroy output buffers, destroy events
 ```
 
-**Compile options** are a *serialized `CompileOptionsProto`*. An empty string takes XLA's defaults, which is what v1 wants; any non-default option would mean hand-encoding protobuf for that field. That is a real but bounded cost, and it is why we add no protobuf dependency for it.
+**Compile options** are a *serialized `CompileOptionsProto`*, in **binary** protobuf form: XLA parses them with `ParseFromArray`, so passing text fails with `failed to deserialize CompileOptionsProto`. An empty proto is *not* the way to get XLA's defaults either — it leaves `num_replicas` at 0 and XLA dies on `Check failed: replica_count > 0`. v1 therefore hand-encodes the six bytes of `executable_build_options { num_replicas: 1 num_partitions: 1 }` (`compile_options_one_replica` in `src/pjrt/client.zig`). Any further option means hand-encoding another field: a real but bounded cost, and the reason we take no protobuf dependency.
 
-**Teardown order** is strict — output buffers → events → loaded executable → executable → client → `DynLib.close()`. A `deinit` that leaves buffers alive is the likeliest leak, so `DeviceBuffer` is an owned handle with a `deinit` and the suite runs under leak detection.
+**Teardown order** is strict — output buffers → events → loaded executable → executable → client. The one thing deliberately *not* done is `DynLib.close()`: the plugin registers an `atexit` handler that `dlclose` does not unregister, so on exit the process jumps into unloaded code and dies of SIGSEGV — *after* the tests have passed, turning a green build red. The handle is leaked on purpose: a process loads the plugin once, and `dlopen` on an already-loaded path is a no-op. Leaving buffers alive is the likeliest real leak, so `DeviceBuffer` is an owned handle with a `deinit` and the suite runs under leak detection.
 
 ### Compile cache
 
@@ -228,9 +229,9 @@ Two layers, both keyed on `hash(StableHLO text ‖ plugin xla_version ‖ stable
 
 ### PJRT-specific risks
 
-**API drift is the headline risk.** On the header checked, `PJRT_Buffer_CopyToHost` **does not exist** — device-to-host is `PJRT_Buffer_ToHostBuffer` (size query with `dst = nullptr`, then copy, each returning a `PJRT_Event`) or `PJRT_Buffer_CopyRawToHost` (added in API 0.56). The official `CHANGELOG.md` has no entry for this rename, so the header is the only source of truth; every binding is therefore pinned to a vendored commit, never to a distribution header.
+**API drift is the headline risk.** On the vendored header (API 0.81), `PJRT_Buffer_CopyToHost` **does not exist** — device-to-host is `PJRT_Buffer_ToHostBuffer` (size query with `dst = nullptr`, then copy, each returning a `PJRT_Event`) or `PJRT_Buffer_CopyRawToHost`. The official `CHANGELOG.md` has no entry for this rename, so the header is the only source of truth; every binding is therefore pinned to a header, never to `openxla/xla` HEAD.
 
-**Plugin/header skew.** A plugin built against newer XLA may report a higher `PJRT_API_MINOR` than our vendored header. We accept that direction silently (trailing fields we never read) and refuse to run when the plugin's major/minor is below our minimum. **Plugin availability:** no supported standalone "install the XLA CPU PJRT plugin" package was found; see À VÉRIFIER #4. **Zig churn:** `zig build` APIs moved substantially in 0.15/0.16 (`addModule`/`createModule`, `b.addTranslateC`, `std.Io`, `std.DynLib`), so a Zig release will break `build.zig`; all of it is isolated in one file.
+**Plugin/header skew.** The vendored header is the one shipped inside the `xla-cpu-pjrt` wheel — the header the plugin was actually compiled against — and *not* `openxla/xla` HEAD. `PJRT_Api` is a table of function pointers whose size follows the version, so an older plugin hands back a *shorter* table in which every slot added since is garbage; we therefore refuse to run when `pjrt_api_version.minor_version < min_api_minor`, and accept the other direction silently (trailing fields we never read — that is what forward compatibility means). `min_api_minor` is pinned to the vendored header's own `PJRT_API_MINOR`, with a `comptime` check in `client.zig` that fails the build if the two ever diverge; `third_party/pjrt/PINNED` records the provenance, the hashes and the update procedure. **Zig churn:** `zig build` APIs moved substantially in 0.15/0.16 (`addModule`/`createModule`, `b.addTranslateC`, `std.Io`, `std.DynLib`), so a Zig release will break `build.zig`; all of it is isolated in one file.
 
 ---
 
@@ -310,17 +311,17 @@ Bitwise reproducibility between the oracle and XLA is explicitly **not** a goal;
 
 Each ends with a criterion a stranger can run in a clean checkout.
 
-**Jalon 0 — PJRT smoke test.** Vendor the header, `dlopen` the CPU plugin, compile a hand-written StableHLO module adding two `f32[2,2]` tensors, execute, read back. *Acceptance:* the four returned floats equal `a + b` computed in Zig for fixed literal `a`, `b`, under `std.testing.expectEqual` (bitwise). On failure the `PJRT_Error_Message` is printed.
+**Milestone 0 — PJRT smoke test.** Vendor the header, `dlopen` the CPU plugin, compile a hand-written StableHLO module adding two `f32[2,2]` tensors, execute, read back. *Acceptance:* the four returned floats equal `a + b` computed in Zig for fixed literal `a`, `b`, under `std.testing.expectEqual` (bitwise). On failure the `PJRT_Error_Message` is printed.
 
-**Jalon 1 — IR, oracle, autodiff.** `Graph`/`Builder`, the CPU interpreter, and rules for `add`, `mul`, `relu`, `matmul`, `reduceSum`, `logSoftmax`. *Acceptance:* every op has a `tests/grad_check` case passing at the f64 threshold (`1e-5` max relative); `zig build test` runs the set under `std.testing.allocator` with zero leaks; `relu` additionally has a hand-written expected-value test at exactly 0, since finite differences cannot resolve the kink.
+**Milestone 1 — IR, oracle, autodiff.** `Graph`/`Builder`, the CPU interpreter, and rules for `add`, `mul`, `relu`, `matmul`, `reduceSum`, `logSoftmax`. *Acceptance:* every op has a `tests/grad_check` case passing at the f64 threshold (`1e-5` max relative); `zig build test` runs the set under `std.testing.allocator` with zero leaks; `relu` additionally has a hand-written expected-value test at exactly 0, since finite differences cannot resolve the kink.
 
-**Jalon 2 — Emission + PJRT execution.** `emit.lower`, `runtime.Client`, `Executable.execute`. *Acceptance:* for every grad-check case the PJRT gradients match the oracle within `atol 1e-4`; the round trip emits exactly one `func.func`; compiling the same program twice hits the in-process cache, asserted via a compile counter.
+**Milestone 2 — Emission + PJRT execution.** `emit.lower`, `runtime.Client`, `Executable.execute`. *Acceptance:* for every grad-check case the PJRT gradients match the oracle within `atol 1e-4`; the round trip emits exactly one `func.func`; compiling the same program twice hits the in-process cache, asserted via a compile counter.
 
-**Jalon 3 — MLP MNIST + Adam.** *Acceptance:* committed `loss_curve.json` from Kindred and from JAX, identical seed and data order, whose 200-step curves agree within `1e-3` and both reach a final loss below `2.4` on a fixed 10k subset; reproducible from a clean checkout with no network.
+**Milestone 3 — MLP MNIST + Adam.** *Acceptance:* committed `loss_curve.json` from Kindred and from JAX, identical seed and data order, whose 200-step curves agree within `1e-3` and both reach a final loss below `2.4` on a fixed 10k subset; reproducible from a clean checkout with no network.
 
-**Jalon 4 — Tiny transformer.** `Embedding`, masked `MultiHeadAttention`, pre-norm `LayerNorm`, `GELU`, learned positional embedding, cross-entropy on a small fixed corpus. *Acceptance:* attention and layernorm each have a grad-check case against JAX `value_and_grad`; a 2-layer model trains below a committed loss threshold on a fixed seed; a masking test proves the gradient of position *i*'s loss is zero w.r.t. all positions `> i`.
+**Milestone 4 — Tiny transformer.** `Embedding`, masked `MultiHeadAttention`, pre-norm `LayerNorm`, `GELU`, learned positional embedding, cross-entropy on a small fixed corpus. *Acceptance:* attention and layernorm each have a grad-check case against JAX `value_and_grad`; a 2-layer model trains below a committed loss threshold on a fixed seed; a masking test proves the gradient of position *i*'s loss is zero w.r.t. all positions `> i`.
 
-**Jalon 5 — safetensors.** *Acceptance:* weights from a safetensors file load into `ParamStore` and yield an MNIST loss within `1e-4` of the pre-save training loss; save→load→predict round-trips bitwise.
+**Milestone 5 — safetensors.** *Acceptance:* weights from a safetensors file load into `ParamStore` and yield an MNIST loss within `1e-4` of the pre-save training loss; save→load→predict round-trips bitwise.
 
 ---
 
@@ -328,31 +329,33 @@ Each ends with a criterion a stranger can run in a clean checkout.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Activations retained across the reverse pass | OOM outside toy models | Rematerialisation (`remat` as a first-class `Builder` op) is the main lever and needs its own milestone after Jalon 4. XLA's buffer assignment decides what actually stays resident; we only control the graph. |
+| Activations retained across the reverse pass | OOM outside toy models | Rematerialisation (`remat` as a first-class `Builder` op) is the main lever and needs its own milestone after Milestone 4. XLA's buffer assignment decides what actually stays resident; we only control the graph. |
 | No hand-written kernels | Slower than a tuned runtime; no flash-attention or fused RMSNorm+matmul | Accepted for v1; revisit with `CustomCall` only if measurements demand it. |
 | Dynamic shapes | Every new batch size is a recompile | Bucketing in `src/nn`. `PJRT_Buffer_UnpaddedDimensions` / `DynamicDimensionIndices` exist in the API; v1 ignores them. |
 | PJRT API drift (§6) | Run-time breakage on plugin upgrade | Pinned vendored header + CI diff job. |
 | Zig language/stdlib churn | `build.zig` breaks on upgrade | Isolated in one file; CI pins one Zig version. |
-| Plugin availability | Blocks Jalon 0 | Resolve before writing any emitter code. |
+| Plugin availability | ~~Blocks Milestone 0~~ Resolved | Vendored from the `xla-cpu-pjrt` wheel; provenance and update procedure in `third_party/pjrt/PINNED`. |
 | StableHLO version skew | Emitted text rejected by the plugin | Read `stablehlo_current_version` / `stablehlo_minimum_version` from `PJRT_Plugin_Attributes` at startup and refuse to run outside the interval. |
 | In-graph gradient accumulation | Graph can grow superlinearly with fan-out | Cap adjoints per node; measure on the transformer model. |
 | Non-deterministic XLA reductions | Loss curves not bitwise reproducible | Accept; compare curves, not individual steps. |
 
-**Open questions.** Does the optimizer belong in the graph? Currently no (§7); reconsider if host-device sync dominates on GPU. Should `Builder` expose a function-style transform API (`fn f(*Builder, []Value) !Value`) so models compose without classes? Leaning yes. Is `remat` needed before Jalon 4 or after? Do we need non-default `PJRT_Client_Compile` options in v1? Leaning no.
+**Open questions.** Does the optimizer belong in the graph? Currently no (§7); reconsider if host-device sync dominates on GPU. Should `Builder` expose a function-style transform API (`fn f(*Builder, []Value) !Value`) so models compose without classes? Leaning yes. Is `remat` needed before Milestone 4 or after? Do we need non-default `PJRT_Client_Compile` options in v1? Leaning no.
 
-### À VÉRIFIER
+### TO VERIFY
 
-1. Whether PJRT/XLA **requires the entry function to be named `main`** — not stated in the header or in `pjrt_integration.md`; assumed from HLO convention. Must be settled before the emitter is written.
-2. Whether `PJRT_Executable_Serialize` / `DeserializeAndLoad` are supported and stable on the CPU and GPU plugins.
-3. Whether the CPU plugin supports `PJRT_HostBufferSemantics_kMutableZeroCopy` (in-place parameter donation), which would remove one H2D copy per step.
-4. **Exact distribution channel for a prebuilt PJRT CPU plugin.** No official standalone package was found; candidates include plugins shipped inside `jaxlib` wheels, whose on-disk layout was not confirmed. **Blocks Jalon 0.**
-5. `PJRT_Buffer_ToHostBuffer` vs the older `PJRT_Buffer_CopyToHost` naming across XLA revisions — the official `CHANGELOG.md` has no entry for the rename, so the introducing minor version is unconfirmed.
-6. The StableHLO version to target. Resolved at runtime from plugin attributes; the value to pin in `vendor/PINNED` is unconfirmed.
-7. The minimum `PJRT_API_MINOR` asserted at startup — candidate: the version at which `PJRT_Buffer_ToHostBuffer` exists (currently ≤ 116).
-8. Whether `PJRT_Client_Compile` with `format = "mlir"` accepts StableHLO *text* on the target plugin (the header says "MLIR module bytecode (or string)", implying yes).
+Items 4, 5 and 7 were settled during Milestone 0; item 1 is half-settled. The rest are still open.
+
+1. **Half-settled.** The entry function *is* accepted when named `main` — the Milestone 0 smoke test compiles and executes a `func.func @main` end to end. Whether another name would also work is still unconfirmed: neither the header nor `pjrt_integration.md` states the requirement, so "required" remains an assumption from HLO convention. To settle it, rename the entry point in `smoke_mlir` and see whether the plugin still compiles it.
+2. Whether `PJRT_Executable_Serialize` / `DeserializeAndLoad` are supported and stable on the CPU and GPU plugins. Both are in the header; nothing is known about plugin-side support.
+3. Whether the CPU plugin supports `PJRT_HostBufferSemantics_kMutableZeroCopy` (in-place parameter donation), which would remove one H2D copy per step. The header describes it, including "on non-CPU platforms this acts identically to `kImmutableUntilTransferCompletes`", but v1 currently passes `kImmutableUntilTransferCompletes`.
+4. **Resolved.** The distribution channel is the `xla-cpu-pjrt` PyPI wheel; its bundled `libpjrt_cpu.so` plus the matching header are vendored, and `third_party/pjrt/PINNED` records the exact wheel, both sha256 and the path inside the archive. `scripts/package_pjrt_releases.sh` republishes them per platform. Milestone 0 is no longer blocked.
+5. **Resolved.** At API 0.81 the function is `PJRT_Buffer_ToHostBuffer` and `PJRT_Buffer_CopyToHost` is absent from the header, so the rename happened before 0.81. The exact introducing minor version stays unknown — the changelog has no entry — but it no longer matters, since the header is pinned to the plugin.
+6. The StableHLO version to target. Resolved at runtime from plugin attributes; the value to pin in `third_party/pjrt/PINNED` is unconfirmed.
+7. **Resolved.** `min_api_minor` is not a judgement call any more: it is pinned to the vendored header's own `PJRT_API_MINOR` (81), and `client.zig` carries a `comptime` check that fails the build if the two drift apart.
+8. Whether `PJRT_Client_Compile` with `format = "mlir"` accepts StableHLO *text* on the target plugin (the header says "MLIR module bytecode (or string)", implying yes). Milestone 0 confirms it for the CPU plugin.
 9. Whether `PJRT_Executable_OutputElementTypes` and `OutputDimensions` are mandatory on all plugins or may be null.
 10. GPU `PJRT_Client_Create` `create_options` keys (preallocation, platform) for CUDA and ROCm — typed `PJRT_NamedValue*` in the header, but the keys are undocumented.
-11. Whether translate-c over a 3 200-line header is fast enough to stay in the default build graph, or should be opt-in. Fast locally; unmeasured on CI.
+11. Whether translate-c over the vendored 2 694-line header is fast enough to stay in the default build graph, or should be opt-in. Fast locally; unmeasured on CI.
 
 ---
 
@@ -372,12 +375,12 @@ Each ends with a criterion a stranger can run in a clean checkout.
 
 ---
 
-## Décisions à valider
+## Decisions to validate
 
 1. **Minimum Zig version.** The repo is on 0.16.0. Floor there (matches today, but forces churn on every release) or hold at 0.15.x for a wider audience?
-2. **Plugin acquisition** (À VÉRIFIER #4). Vendor a pinned prebuilt plugin in-repo, resolve it from `jaxlib` at runtime, or require a user-supplied path? This gates Jalon 0 and I would rather not guess.
+2. **Plugin acquisition.** Settled: a prebuilt plugin is vendored in-repo from the `xla-cpu-pjrt` PyPI wheel, pinned by hash in `third_party/pjrt/PINNED`, and resolved by `-Dpjrt_plugin` when a user supplies their own. Milestone 0 is unblocked.
 3. **`src/interp` added to the layout.** Confirm the addition, and whether the oracle is a full interpreter or covers only the ops with grad-check cases.
 4. **Optimizer stays host-side** (§7), or in the compiled graph from the start?
-5. **Scope of Jalon 4** — 2-layer, 4-head, 128-dim decoder on a fixed small corpus, or larger? This sets the memory pressure that decides whether `remat` lands in v1 or v2.
-6. **dtypes.** Is `f32`-only acceptable through Jalon 4, or does `bf16` need to work for the transformer milestone to be meaningful on GPU?
+5. **Scope of Milestone 4** — 2-layer, 4-head, 128-dim decoder on a fixed small corpus, or larger? This sets the memory pressure that decides whether `remat` lands in v1 or v2.
+6. **dtypes.** Is `f32`-only acceptable through Milestone 4, or does `bf16` need to work for the transformer milestone to be meaningful on GPU?
 7. **API freeze.** Is the sketched surface (`Graph`/`Builder`/`gradients`/`emit.lower`/`runtime.Client`/`nn`/`optim`) close enough to freeze, or should I produce a second, narrower proposal before implementation starts?

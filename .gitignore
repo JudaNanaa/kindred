@@ -1,3 +1,5 @@
 zig-out/
+dist/
+zig-pkg/
 third_party/pjrt/plugins/xla_cpu_pjrt.so
 .zig-cache/

@@ -1,0 +1,30 @@
+Vendored PJRT C API
+====================
+
+File          third_party/pjrt/include/pjrt_c_api.h
+Provenance    header bundled in the xla-cpu-pjrt PyPI wheel, i.e. the one the
+              plugin was actually compiled against.
+Package       xla-cpu-pjrt 0.0.1 (xla_cpu_pjrt-0.0.1-py3-none-manylinux_2_27_x86_64.whl)
+              sha256 55837b6b7b47daa717f2d9a5a03563ea0ceaa338d06a81a1e2d3f060d960decc
+              path  xla_plugins/xla_cpu_pjrt/include/pjrt_c_api.h
+sha256        c85bb95cb1743c2a353a555b3ab35f065e5f17007c7f182ad68d23754950235c
+PJRT_API_MAJOR 0
+PJRT_API_MINOR 81
+
+Why the plugin's header and not openxla/xla HEAD
+------------------------------------------------
+`PJRT_Api` is a table of function pointers whose size follows the API version: an
+older plugin hands back a *shorter* table. Reading past its end would yield
+garbage pointers, hence the explicit refusal when
+`pjrt_api_version.minor_version < min_api_minor` (see `src/pjrt/client.zig`).
+
+Reasoning the other way — "newer header than plugin, therefore lower
+`min_api_minor`" — does not hold: the entries added after 0.81 are holes the plugin
+will never fill. The header must therefore track the plugin, not the other way
+round, and `client.zig` carries a `comptime` check that fails if the two diverge.
+
+Updating
+--------
+    PJRT_VERSION=<exact> ./scripts/package_pjrt_releases.sh
+then replace this file with the wheel's header and update the two values above
+as well as `min_api_minor`.
